@@ -2,6 +2,7 @@ package kallsyms
 
 import (
 	"bytes"
+	"runtime"
 	"testing"
 
 	"github.com/go-quicktest/qt"
@@ -36,4 +37,16 @@ func TestKernelModule(t *testing.T) {
 	}
 
 	qt.Assert(t, qt.Equals(kmods["nft_counter_seq"], ""))
+}
+
+func BenchmarkKernelModuleMemory(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		FlushKernelModuleCache()
+		runtime.GC()
+
+		b.StartTimer()
+		KernelModule("foo")
+	}
 }
