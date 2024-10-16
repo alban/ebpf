@@ -46,6 +46,18 @@ func KernelHasBTF() bool {
 	return false
 }
 
+// LoadKernelSpecWithOptions returns the current kernel's BTF information.
+//
+// Defaults to /sys/kernel/btf/vmlinux and falls back to scanning the file system
+// for vmlinux ELFs. Returns an error wrapping ErrNotSupported if BTF is not enabled.
+//
+// The provided options are used to configure the BTF loading process.
+func LoadKernelSpecWithOptions(opts *SpecOptions) (*Spec, error) {
+	spec, _, err := loadKernelSpec(opts)
+	// without copy
+	return spec, err
+}
+
 // LoadKernelSpec returns the current kernel's BTF information.
 //
 // Defaults to /sys/kernel/btf/vmlinux and falls back to scanning the file system
@@ -66,7 +78,7 @@ func LoadKernelSpec() (*Spec, error) {
 		return spec.Copy(), nil
 	}
 
-	spec, _, err := loadKernelSpec()
+	spec, _, err := loadKernelSpec(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -110,12 +122,12 @@ func LoadKernelModuleSpec(module string) (*Spec, error) {
 	return spec.Copy(), nil
 }
 
-func loadKernelSpec() (_ *Spec, fallback bool, _ error) {
+func loadKernelSpec(opts *SpecOptions) (_ *Spec, fallback bool, _ error) {
 	fh, err := os.Open("/sys/kernel/btf/vmlinux")
 	if err == nil {
 		defer fh.Close()
 
-		spec, err := loadRawSpec(fh, internal.NativeEndian, nil)
+		spec, err := loadRawSpec(fh, internal.NativeEndian, nil, opts)
 		return spec, false, err
 	}
 
@@ -125,7 +137,7 @@ func loadKernelSpec() (_ *Spec, fallback bool, _ error) {
 	}
 	defer file.Close()
 
-	spec, err := LoadSpecFromReader(file)
+	spec, err := LoadSpecFromReaderWithOptions(file, opts)
 	return spec, true, err
 }
 
@@ -141,7 +153,7 @@ func loadKernelModuleSpec(module string, base *Spec) (*Spec, error) {
 	}
 	defer fh.Close()
 
-	return loadRawSpec(fh, internal.NativeEndian, base)
+	return loadRawSpec(fh, internal.NativeEndian, base, nil)
 }
 
 // findVMLinux scans multiple well-known paths for vmlinux kernel images.
