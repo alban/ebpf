@@ -789,7 +789,10 @@ func readAndInflateTypes(r io.Reader, reset func(int64), bo binary.ByteOrder, ty
 	// Void is defined to always be type ID 0, and is thus omitted from BTF.
 	types = append(types, (*Void)(nil))
 
+	fmt.Printf("DEBUG: readAndInflateTypes called typeLen=%d opts=%+v\n", typeLen, opts)
+
 	firstTypeID := TypeID(0)
+	firstTypeIDWithoutVoid := TypeID(1)
 	if base != nil {
 		var err error
 		firstTypeID, err = base.nextTypeID()
@@ -799,6 +802,7 @@ func readAndInflateTypes(r io.Reader, reset func(int64), bo binary.ByteOrder, ty
 
 		// Split BTF doesn't contain Void.
 		types = types[:0]
+		firstTypeIDWithoutVoid = firstTypeID
 	}
 
 	type fixupDef struct {
@@ -819,14 +823,18 @@ func readAndInflateTypes(r io.Reader, reset func(int64), bo binary.ByteOrder, ty
 	}
 
 	appendItem := func(rawID TypeID) {
-		if rawID <= firstTypeID {
+		if rawID < firstTypeIDWithoutVoid {
 			return
 		}
-		newTypeIdx := int(rawID - firstTypeID - 1)
+		newTypeIdx := int(rawID - firstTypeIDWithoutVoid)
 
+		if rawID == 11207 {
+			//panic("append 11207")
+		}
 		if keep[newTypeIdx] {
 			return // already marked
 		}
+		//fmt.Printf("DEBUG: appendItem %d\n", rawID)
 		newIdx[newTypeIdx] = len(types) + len(remainingIdxToProcess)
 		remainingIdxToProcess = append(remainingIdxToProcess, newTypeIdx)
 		keep[newTypeIdx] = true
@@ -918,7 +926,7 @@ func readAndInflateTypes(r io.Reader, reset func(int64), bo binary.ByteOrder, ty
 	idx := 0
 	for {
 		var (
-			id = firstTypeID + TypeID(len(types))
+			id = firstTypeIDWithoutVoid + TypeID(len(types))
 		)
 
 		if _, err := io.ReadFull(r, buf[:btfTypeLen]); err == io.EOF {
@@ -931,7 +939,7 @@ func readAndInflateTypes(r io.Reader, reset func(int64), bo binary.ByteOrder, ty
 			return nil, fmt.Errorf("can't unmarshal type info for id %v: %v", id, err)
 		}
 
-		if id < firstTypeID {
+		if id < firstTypeIDWithoutVoid {
 			return nil, fmt.Errorf("no more type IDs")
 		}
 
@@ -1004,10 +1012,14 @@ func readAndInflateTypes(r io.Reader, reset func(int64), bo binary.ByteOrder, ty
 		}
 	}
 
+	processedCount := 0
+
 	// Second pass: initializing types that pass the filter
 	for len(remainingIdxToProcess) > 0 {
 		var pos int
 		pos, remainingIdxToProcess = remainingIdxToProcess[0], remainingIdxToProcess[1:]
+
+		processedCount++
 
 		reset(int64(offsets[pos]))
 
@@ -1037,16 +1049,17 @@ func readAndInflateTypes(r io.Reader, reset func(int64), bo binary.ByteOrder, ty
 				return nil, fmt.Errorf("can't unmarshal btfInt, pos: %d: %w", pos, err)
 			}
 			if bInt.Offset() > 0 || bInt.Bits().Bytes() != size {
-				id := firstTypeID + TypeID(pos)
-				if base == nil {
-					id++
-				}
+				id := firstTypeIDWithoutVoid + TypeID(pos)
 				legacyBitfields[id] = [2]Bits{bInt.Offset(), bInt.Bits()}
 			}
 			typ = &Int{name, header.Size(), bInt.Encoding()}
 
 		case kindPointer:
 			ptr := &Pointer{nil}
+			if header.Type() == 11207 {
+				fmt.Printf("pos=%d len(types)=%d base=%v firstTypeID %d %d\n", pos, len(types), base, firstTypeID, firstTypeIDWithoutVoid)
+				//panic("append 11207")
+			}
 			appendItem(header.Type())
 			fixup(header.Type(), &ptr.Target)
 			typ = ptr
@@ -1289,44 +1302,62 @@ func readAndInflateTypes(r io.Reader, reset func(int64), bo binary.ByteOrder, ty
 		types = append(types, typ)
 	}
 
+	countKeep := 0
+	for i := range keep {
+		if keep[i] {
+			countKeep++
+		}
+	}
+	countNewIdx := 0
+	for i := range newIdx {
+		if newIdx[i] != -1 {
+			countNewIdx++
+		}
+	}
+	fmt.Printf("DEBUG: readAndInflateTypes: countKeep=%d countNewIdx=%d len(types)=%d processedCount=%d\n", countKeep, countNewIdx, len(types), processedCount)
+
 	for _, fixup := range fixups {
 		if fixup.id < firstTypeID {
 			return nil, fmt.Errorf("fixup for base type id %d is not expected", fixup.id)
 		}
-
-		idx := int(fixup.id - firstTypeID)
-
-		// if idx is 0, that's the Void type. No need to adjust
-		if idx > 0 {
-			idx = newIdx[idx-1]
-
-			if idx == -1 {
-				return nil, fmt.Errorf("reference to skipped type id: %d", fixup.id)
-			} else {
-				idx++
-			}
+		if fixup.id < firstTypeIDWithoutVoid {
+			// Void, nothing to adjust
+			*fixup.typ = types[int(fixup.id-firstTypeID)]
+			continue
 		}
+
+		idx := int(fixup.id - firstTypeIDWithoutVoid)
+		idx = newIdx[idx]
+		if idx == -1 {
+			return nil, fmt.Errorf("reference to skipped type id: %d", fixup.id)
+		} else {
+			idx += int(firstTypeIDWithoutVoid) - int(firstTypeID)
+		}
+
 		if idx >= len(types) {
+			fmt.Printf("DEBUG: fixup.id=%d idx=%d len(types)=%d firstTypeID=%d firstTypeIDWithoutVoid=%d\n", fixup.id, idx, len(types), firstTypeID, firstTypeIDWithoutVoid)
+			//fmt.Printf("DEBUG: types=%+v\n", types)
 			return nil, fmt.Errorf("reference to invalid type id: %d", fixup.id)
+		}
+
+		if idx == -1 {
+			panic(fmt.Sprint("idx == -1. fixup.id=", fixup.id, " base=", base, " firstTypeIDWithoutVoid=", firstTypeIDWithoutVoid))
 		}
 
 		*fixup.typ = types[idx]
 	}
 
 	for _, bitfieldFixup := range bitfieldFixups {
-		if bitfieldFixup.id < firstTypeID {
+		if bitfieldFixup.id < firstTypeIDWithoutVoid {
 			return nil, fmt.Errorf("bitfield fixup from split to base types is not expected")
 		}
 
-		idx := bitfieldFixup.id - firstTypeID
-		if idx > 0 {
-			idx = TypeID(newIdx[idx-1])
-
-			if int(idx) == -1 {
-				return nil, fmt.Errorf("reference to skipped type id: %d", bitfieldFixup.id)
-			} else {
-				idx++
-			}
+		idx := bitfieldFixup.id - firstTypeIDWithoutVoid
+		idx = TypeID(newIdx[idx])
+		if int(idx) == -1 {
+			return nil, fmt.Errorf("reference to skipped type id: %d", bitfieldFixup.id)
+		} else {
+			idx += firstTypeIDWithoutVoid - firstTypeID
 		}
 
 		data, ok := legacyBitfields[idx]
