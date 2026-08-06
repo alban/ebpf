@@ -108,8 +108,16 @@ func TestFindTracefsInEntries(t *testing.T) {
 
 	t.Run("first tracefs entry wins when multiple", func(t *testing.T) {
 		got := findTracefsInEntries([]mountinfo.Entry{
-			{MountPoint: "/sys/kernel/tracing", Root: "/", FSType: "tracefs"},
 			{MountPoint: "/host/sys/kernel/tracing", Root: "/", FSType: "tracefs"},
+			{MountPoint: "/other/tracing", Root: "/", FSType: "tracefs"},
+		})
+		qt.Assert(t, qt.Equals(got, "/host/sys/kernel/tracing"))
+	})
+
+	t.Run("canonical tracefs entry wins when listed after other mounts", func(t *testing.T) {
+		got := findTracefsInEntries([]mountinfo.Entry{
+			{MountPoint: "/host/sys/kernel/tracing", Root: "/", FSType: "tracefs"},
+			{MountPoint: "/sys/kernel/tracing", Root: "/", FSType: "tracefs"},
 		})
 		qt.Assert(t, qt.Equals(got, "/sys/kernel/tracing"))
 	})

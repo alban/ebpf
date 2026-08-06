@@ -114,38 +114,29 @@ func sanitizeTracefsPath(path ...string) (string, error) {
 //
 // The discovery order is:
 //
-//  1. Any tracefs mount listed in /proc/self/mountinfo (kernel 4.1+).
-//     This works regardless of where the mount sits in the filesystem,
-//     so containers that bind-mount tracefs at a non-canonical path are
-//     supported automatically.
-//  2. A debugfs mount with a tracing/ subdirectory, for older systems
-//     where tracefs has not been lifted out of debugfs.
-//  3. As a final fallback, probe the canonical kernel paths
-//     (/sys/kernel/tracing, /sys/kernel/debug/tracing) directly with
-//     statfs. This catches edge cases where /proc/self/mountinfo is
-//     unavailable or doesn't report the mount.
+//  1. Probe the canonical paths directly. The debugfs compatibility path is
+//     opened before checking its filesystem type to trigger its tracefs
+//     automount when available.
+//  2. Root tracefs mounts listed in /proc/self/mountinfo. This retains support
+//     for containers that expose tracefs only at a non-canonical path.
+//  3. A root debugfs mount whose tracing/ directory can be opened.
+//
+// Tracefs and the debugfs compatibility automount were introduced in Linux
+// 4.1:
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=3b6c774ea869
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f76180bc07ab
 var getTracefsPath = sync.OnceValues(func() (string, error) {
 	if !platform.IsLinux {
 		return "", fmt.Errorf("tracefs: %w", internal.ErrNotSupportedOnOS)
 	}
 
+	if path := findTracefsInCanonicalPaths(); path != "" {
+		return path, nil
+	}
+
 	if entries, err := mountinfo.Read(); err == nil {
 		if path := findTracefsInEntries(entries); path != "" {
 			return path, nil
-		}
-	}
-
-	for _, p := range []struct {
-		path   string
-		fsType int64
-	}{
-		{"/sys/kernel/tracing", unix.TRACEFS_MAGIC},
-		{"/sys/kernel/debug/tracing", unix.TRACEFS_MAGIC},
-		// RHEL/CentOS
-		{"/sys/kernel/debug/tracing", unix.DEBUGFS_MAGIC},
-	} {
-		if fsType, err := linux.FSType(p.path); err == nil && fsType == p.fsType {
-			return p.path, nil
 		}
 	}
 
@@ -157,6 +148,15 @@ var getTracefsPath = sync.OnceValues(func() (string, error) {
 //
 // Returns an empty string when no usable mount is found.
 func findTracefsInEntries(entries []mountinfo.Entry) string {
+	// Prefer canonical tracefs mounts over mounts exposed through bind mounts,
+	// such as Kubernetes pod volume mounts.
+	for _, canonical := range []string{"/sys/kernel/tracing", "/sys/kernel/debug/tracing"} {
+		for _, e := range entries {
+			if e.MountPoint == canonical && e.FSType == "tracefs" && e.Root == "/" {
+				return e.MountPoint
+			}
+		}
+	}
 	for _, e := range entries {
 		if e.FSType == "tracefs" && e.Root == "/" {
 			return e.MountPoint
@@ -166,10 +166,41 @@ func findTracefsInEntries(entries []mountinfo.Entry) string {
 		if e.FSType != "debugfs" || e.Root != "/" {
 			continue
 		}
-		tracing := filepath.Join(e.MountPoint, "tracing")
-		if info, err := os.Stat(tracing); err == nil && info.IsDir() {
+		if tracing := tracefsFromDebugfsEntry(e); tracing != "" {
 			return tracing
 		}
+	}
+	return ""
+}
+
+func findTracefsInCanonicalPaths() string {
+	if fsType, err := linux.FSType("/sys/kernel/tracing"); err == nil && fsType == unix.TRACEFS_MAGIC {
+		return "/sys/kernel/tracing"
+	}
+
+	const debugfsTracing = "/sys/kernel/debug/tracing"
+	f, err := os.Open(debugfsTracing)
+	if err != nil {
+		return ""
+	}
+	_ = f.Close()
+	if fsType, err := linux.FSType(debugfsTracing); err == nil &&
+		(fsType == unix.TRACEFS_MAGIC || fsType == unix.DEBUGFS_MAGIC) {
+		return debugfsTracing
+	}
+	return ""
+}
+
+func tracefsFromDebugfsEntry(e mountinfo.Entry) string {
+	tracing := filepath.Join(e.MountPoint, "tracing")
+	f, err := os.Open(tracing)
+	if err != nil {
+		return ""
+	}
+	info, statErr := f.Stat()
+	_ = f.Close()
+	if statErr == nil && info.IsDir() {
+		return tracing
 	}
 	return ""
 }
