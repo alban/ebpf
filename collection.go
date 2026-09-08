@@ -9,6 +9,9 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal"
@@ -42,6 +45,22 @@ type CollectionOptions struct {
 	// allocate a Cache via [btf.NewCache] and share it across loads.
 	// If nil, a fresh cache is allocated per load and discarded.
 	Cache *btf.Cache
+
+	// LoadConcurrency controls how many programs are verified by the kernel
+	// concurrently when loading a Collection. Loading programs in parallel can
+	// significantly speed up startup when a Collection contains many or large
+	// programs, because privileged (CAP_BPF) program loads are not serialized
+	// by the kernel's verifier lock.
+	//
+	// A value of 0 (the default) selects a bound based on [runtime.GOMAXPROCS].
+	// A value of 1 disables concurrency and loads programs sequentially. Values
+	// larger than the number of programs have no additional effect.
+	//
+	// Program preparation (map fd association) always happens sequentially;
+	// only the in-kernel verification is parallelised. The first error
+	// encountered is returned, and all successfully loaded programs are cleaned
+	// up on failure.
+	LoadConcurrency int
 }
 
 // CollectionSpec describes a collection.
@@ -289,14 +308,17 @@ func NewCollectionWithOptions(spec *CollectionSpec, opts CollectionOptions) (*Co
 		}
 	}
 
+	progNames := make([]string, 0, len(spec.Programs))
 	for progName, prog := range spec.Programs {
 		if prog.Type == UnspecifiedProgram {
 			continue
 		}
 
-		if _, err := loader.loadProgram(progName); err != nil {
-			return nil, err
-		}
+		progNames = append(progNames, progName)
+	}
+
+	if err := loader.loadPrograms(progNames); err != nil {
+		return nil, err
 	}
 
 	for varName := range spec.Variables {
@@ -461,6 +483,26 @@ func (cl *collectionLoader) loadProgram(progName string) (*Program, error) {
 		return prog, nil
 	}
 
+	progSpec, err := cl.prepareProgram(progName)
+	if err != nil {
+		return nil, err
+	}
+
+	prog, err := newProgramWithOptions(progSpec, cl.opts.Programs, cl.types)
+	if err != nil {
+		return nil, fmt.Errorf("program %s: %w", progName, err)
+	}
+
+	cl.programs[progName] = prog
+
+	return prog, nil
+}
+
+// prepareProgram returns a copy of the named program's spec with all map
+// references resolved to loaded maps, ready to be passed to
+// [newProgramWithOptions]. It reads and writes shared loader state (via
+// [loadMap]) and must not be called concurrently.
+func (cl *collectionLoader) prepareProgram(progName string) (*ProgramSpec, error) {
 	progSpec := cl.coll.Programs[progName]
 	if progSpec == nil {
 		return nil, fmt.Errorf("unknown program %s", progName)
@@ -500,14 +542,98 @@ func (cl *collectionLoader) loadProgram(progName string) (*Program, error) {
 		}
 	}
 
-	prog, err := newProgramWithOptions(progSpec, cl.opts.Programs, cl.types)
-	if err != nil {
-		return nil, fmt.Errorf("program %s: %w", progName, err)
+	return progSpec, nil
+}
+
+// loadPrograms loads the named programs into the kernel, potentially verifying
+// several of them concurrently (see [CollectionOptions.LoadConcurrency]).
+//
+// All referenced maps must already be loaded so that the sequential preparation
+// phase does not create maps, allowing the concurrent verification phase to run
+// without racing on shared loader state.
+func (cl *collectionLoader) loadPrograms(names []string) error {
+	// Preparation touches shared loader state (loadMap) and therefore runs
+	// sequentially. Only the in-kernel verification below is parallelised.
+	type job struct {
+		name string
+		spec *ProgramSpec
+	}
+	jobs := make([]job, 0, len(names))
+	for _, name := range names {
+		if cl.programs[name] != nil {
+			continue
+		}
+
+		spec, err := cl.prepareProgram(name)
+		if err != nil {
+			return err
+		}
+		jobs = append(jobs, job{name, spec})
 	}
 
-	cl.programs[progName] = prog
+	limit := loadConcurrency(cl.opts.LoadConcurrency, len(jobs))
+	if limit <= 1 {
+		for _, j := range jobs {
+			prog, err := newProgramWithOptions(j.spec, cl.opts.Programs, cl.types)
+			if err != nil {
+				return fmt.Errorf("program %s: %w", j.name, err)
+			}
+			cl.programs[j.name] = prog
+		}
+		return nil
+	}
 
-	return prog, nil
+	var (
+		g      errgroup.Group
+		mu     sync.Mutex
+		loaded = make(map[string]*Program, len(jobs))
+	)
+	g.SetLimit(limit)
+	for _, j := range jobs {
+		g.Go(func() error {
+			// newProgramWithOptions only touches its own ProgramSpec copy, the
+			// read-only ProgramOptions and the goroutine-safe btf.Cache, so it
+			// is safe to run concurrently.
+			prog, err := newProgramWithOptions(j.spec, cl.opts.Programs, cl.types)
+			if err != nil {
+				return fmt.Errorf("program %s: %w", j.name, err)
+			}
+			mu.Lock()
+			loaded[j.name] = prog
+			mu.Unlock()
+			return nil
+		})
+	}
+	err := g.Wait()
+
+	// Register every program that loaded, even on error, so that
+	// collectionLoader.close cleans them up.
+	for name, prog := range loaded {
+		cl.programs[name] = prog
+	}
+
+	return err
+}
+
+// loadConcurrency computes the number of programs to verify concurrently given
+// the requested LoadConcurrency and the number of programs to load. A requested
+// value of 0 defaults to runtime.GOMAXPROCS.
+func loadConcurrency(requested, n int) int {
+	if n <= 0 {
+		return 0
+	}
+
+	limit := requested
+	if limit <= 0 {
+		limit = runtime.GOMAXPROCS(0)
+	}
+	if limit > n {
+		limit = n
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
 }
 
 func (cl *collectionLoader) loadVariable(varName string) (*Variable, error) {

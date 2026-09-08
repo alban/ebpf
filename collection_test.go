@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -608,6 +609,50 @@ func BenchmarkNewCollectionManyProgs(b *testing.B) {
 			b.Fatal(err)
 		}
 		coll.Close()
+	}
+}
+
+func TestLoadConcurrency(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
+
+	for _, tc := range []struct {
+		requested, n, want int
+	}{
+		{0, 0, 0},  // nothing to load
+		{4, 0, 0},  // nothing to load
+		{0, 8, 4},  // default to GOMAXPROCS (set to 4 above)
+		{-1, 8, 4}, // negative treated as default
+		{1, 8, 1},  // explicitly sequential
+		{2, 8, 2},  // explicit bound below n
+		{8, 8, 8},  // exactly n
+		{16, 8, 8}, // clamped to n
+		{6, 3, 3},  // clamped to n
+	} {
+		got := loadConcurrency(tc.requested, tc.n)
+		qt.Assert(t, qt.Equals(got, tc.want),
+			qt.Commentf("loadConcurrency(%d, %d)", tc.requested, tc.n))
+	}
+}
+
+func TestCollectionLoadConcurrency(t *testing.T) {
+	file := testutils.NativeFile(t, "testdata/manyprogs-%s.elf")
+	spec, err := LoadCollectionSpec(file)
+	qt.Assert(t, qt.IsNil(err))
+
+	want := len(spec.Programs)
+	qt.Assert(t, qt.IsTrue(want > 1))
+
+	// Loading with any concurrency setting must produce the same set of
+	// programs. 1 forces the sequential path, higher values and 0 (auto)
+	// exercise the parallel verification path.
+	for _, conc := range []int{1, 2, 4, 0} {
+		t.Run(fmt.Sprintf("concurrency=%d", conc), func(t *testing.T) {
+			coll := mustNewCollection(t, spec, &CollectionOptions{LoadConcurrency: conc})
+			qt.Assert(t, qt.HasLen(coll.Programs, want))
+			for name, prog := range coll.Programs {
+				qt.Assert(t, qt.IsNotNil(prog), qt.Commentf("program %q", name))
+			}
+		})
 	}
 }
 
